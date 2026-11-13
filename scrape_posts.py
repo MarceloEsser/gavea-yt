@@ -16,6 +16,7 @@ This is an unofficial scraper: YouTube can change its page structure at any
 time. If it stops finding posts, the log prints diagnostics.
 """
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import requests
 
+FEEDS_DIR = Path("feeds")
 CHANNELS_FILE = Path("channels.txt")
 STATE_FILE = Path("state.json")
 OUTPUT_FILE = Path("feed.xml")
@@ -39,15 +41,25 @@ HEADERS = {
     "Cookie": "CONSENT=YES+1; SOCS=CAI",
 }
 
+def slugify(text):
+    return re.sub(r"[^a-z0-9_-]+", "-", text.lower()).strip("-") or "channel"
 
 def read_channels():
+    """Lines look like:  UCxxxx  my-slug   # comment   (slug is optional)."""
     channels = []
+    seen_slugs = {}
     for line in CHANNELS_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            channels.append(line)
+        parts = line.split("#", 1)[0].split()
+        if not parts:
+            continue
+        target = parts[0]
+        slug = slugify(parts[1] if len(parts) > 1 else target.lstrip("@"))
+        if slug in seen_slugs:
+            sys.exit(f"Duplicate folder name '{slug}' for {target} and {seen_slugs[slug]} "
+                     f"- give one of them a different slug in channels.txt")
+        seen_slugs[slug] = target
+        channels.append((target, slug))
     return channels
-
 
 def posts_url(channel):
     if channel.startswith("@"):
@@ -173,12 +185,10 @@ def fetch_channel(channel):
         )
     return posts
 
-
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+def load_state(path):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
     return {"posts": {}}
-
 
 def item_html(p):
     parts = []
@@ -202,16 +212,16 @@ def item_title(p):
         text = text[:87] + "..."
     return f'{p["author"]}: {text}'
 
-
-def write_feed(state):
+def write_feed(state, out_path, slug):
     posts = sorted(state["posts"].values(), key=lambda p: p["first_seen"], reverse=True)
     posts = posts[:MAX_ITEMS_IN_FEED]
+    title = posts[0]["author"] if posts else slug
     updated = posts[0]["first_seen"] if posts else datetime.now(timezone.utc).isoformat()
 
     out = ['<?xml version="1.0" encoding="utf-8"?>']
     out.append('<feed xmlns="http://www.w3.org/2005/Atom">')
-    out.append(f"<title>{escape(FEED_TITLE)}</title>")
-    out.append("<id>urn:yt-posts-feed</id>")
+    out.append(f"<title>{escape(title)} - community posts</title>")
+    out.append(f"<id>urn:yt-posts-feed:{escape(slug)}</id>")
     out.append(f"<updated>{escape(updated)}</updated>")
     for p in posts:
         out.append("<entry>")
@@ -223,20 +233,24 @@ def write_feed(state):
         out.append(f'<content type="html">{escape(item_html(p))}</content>')
         out.append("</entry>")
     out.append("</feed>")
-    OUTPUT_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
+    out_path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def main():
-    state = load_state()
     failures = 0
     now = datetime.now(timezone.utc)
 
-    for channel in read_channels():
+    for channel, slug in read_channels():
+        folder = FEEDS_DIR / slug
+        state_path = folder / "state.json"
+        feed_path = folder / "feed.xml"
+        state = load_state(state_path)
+
         try:
             posts = fetch_channel(channel)
-        except Exception as exc:  # noqa: BLE001 - report and continue with next channel
+        except Exception as exc:  # noqa: BLE001 - report, keep old files, go on
             failures += 1
-            print(f"ERROR: {channel}: {exc}", file=sys.stderr)
+            print(f"ERROR: {channel} ({slug}): {exc}", file=sys.stderr)
             continue
 
         new = 0
@@ -250,15 +264,15 @@ def main():
                 p["first_seen"] = (now - timedelta(seconds=index)).isoformat()
                 state["posts"][p["id"]] = p
                 new += 1
-        print(f"{channel}: {len(posts)} posts on page, {new} new")
 
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    write_feed(state)
+        folder.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        write_feed(state, feed_path, slug)
+        print(f"{slug}: {len(posts)} posts on page, {new} new, {len(state['posts'])} stored in total")
 
     if failures:
         print(f"{failures} channel(s) failed - see errors above.", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
