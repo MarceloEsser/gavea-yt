@@ -1,0 +1,3 @@
+# One channel per line: either a channel ID (UC...) or an @handle.
+# Anything after # is a comment.
+UCJmlZf44n6DuIyWMkcZPsKQ   # Philosophical Tetsu
